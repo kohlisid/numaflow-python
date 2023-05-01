@@ -1,12 +1,9 @@
 from google.protobuf import descriptor as _descriptor
 from google.protobuf import message as _message
 from google.protobuf import timestamp_pb2 as _timestamp_pb2
-from google.protobuf import empty_pb2 as google_dot_protobuf_dot_empty__pb2
 from typing import (
     ClassVar as _ClassVar,
-    Mapping as _Mapping,
     Optional as _Optional,
-    Union as _Union,
     List,
 )
 
@@ -34,8 +31,8 @@ class Watermark(_message.Message):
     def __init__(self, watermark: _Optional[_timestamp_pb2.Timestamp] = ...) -> None: ...
 
 class Datum(_message.Message):
-    __slots__ = ["key", "value", "event_time", "watermark"]
-    KEY_FIELD_NUMBER: _ClassVar[int]
+    __slots__ = ["keys", "value", "event_time", "watermark"]
+    KEYS_FIELD_NUMBER: _ClassVar[int]
     VALUE_FIELD_NUMBER: _ClassVar[int]
     EVENT_TIME_FIELD_NUMBER: _ClassVar[int]
     WATERMARK_FIELD_NUMBER: _ClassVar[int]
@@ -46,7 +43,7 @@ class Datum(_message.Message):
 
     def __init__(
         self,
-        key: _Optional[str],
+        keys: _Optional[List[str]],
         value: _Optional[bytes],
         event_time: _Optional[_timestamp_pb2.Timestamp] = ...,
         watermark: _Optional[_timestamp_pb2.Timestamp] = ...,

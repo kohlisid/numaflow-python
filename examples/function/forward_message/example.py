@@ -1,15 +1,17 @@
-from pynumaflow.function import Messages, Message, Datum, UserDefinedFunctionServicer
+from typing import List
+
+from pynumaflow.function import Messages, Message, Datum, Server
 
 
-def my_handler(key: str, datum: Datum) -> Messages:
+def my_handler(keys: List[str], datum: Datum) -> Messages:
     val = datum.value
     _ = datum.event_time
     _ = datum.watermark
     messages = Messages()
-    messages.append(Message.to_vtx(key, val))
+    messages.append(Message(val, keys=keys))
     return messages
 
 
 if __name__ == "__main__":
-    grpc_server = UserDefinedFunctionServicer(map_handler=my_handler)
+    grpc_server = Server(map_handler=my_handler)
     grpc_server.start()

@@ -2,7 +2,7 @@ import logging
 import multiprocessing
 import os
 from concurrent.futures import ThreadPoolExecutor
-from typing import Callable, Iterator
+from typing import Callable, Iterator, Iterable
 
 import grpc
 from google.protobuf import empty_pb2 as _empty_pb2
@@ -12,6 +12,8 @@ from pynumaflow._constants import (
     SINK_SOCK_PATH,
     MAX_MESSAGE_SIZE,
 )
+from pynumaflow.info.server import get_sdk_version, write as info_server_write
+from pynumaflow.info.types import ServerInfo, Protocol, Language, SERVER_INFO_FILE_PATH
 from pynumaflow.sink import Responses, Datum, Response
 from pynumaflow.sink.proto import udsink_pb2_grpc, udsink_pb2
 from pynumaflow.types import NumaflowServicerContext
@@ -25,7 +27,19 @@ _PROCESS_COUNT = multiprocessing.cpu_count()
 MAX_THREADS = int(os.getenv("MAX_THREADS", 0)) or (_PROCESS_COUNT * 4)
 
 
-class UserDefinedSinkServicer(udsink_pb2_grpc.UserDefinedSinkServicer):
+def datum_generator(request_iterator: Iterable[udsink_pb2.DatumRequest]) -> Iterable[Datum]:
+    for d in request_iterator:
+        datum = Datum(
+            keys=list(d.keys),
+            sink_msg_id=d.id,
+            value=d.value,
+            event_time=d.event_time.event_time.ToDatetime(),
+            watermark=d.watermark.watermark.ToDatetime(),
+        )
+        yield datum
+
+
+class Sink(udsink_pb2_grpc.UserDefinedSinkServicer):
     """
     Provides an interface to write a User Defined Sink (UDSink)
     which will be exposed over gRPC.
@@ -39,13 +53,13 @@ class UserDefinedSinkServicer(udsink_pb2_grpc.UserDefinedSinkServicer):
 
     Example invocation:
     >>> from typing import List
-    >>> from pynumaflow.sink import Datum, Responses, Response, UserDefinedSinkServicer
+    >>> from pynumaflow.sink import Datum, Responses, Response, Sink
     >>> def my_handler(datums: Iterator[Datum]) -> Responses:
     ...   responses = Responses()
     ...   for msg in datums:
     ...     responses.append(Response.as_success(msg.id))
     ...   return responses
-    >>> grpc_server = UserDefinedSinkServicer(my_handler)
+    >>> grpc_server = Sink(my_handler)
     >>> grpc_server.start()
     """
 
@@ -68,20 +82,21 @@ class UserDefinedSinkServicer(udsink_pb2_grpc.UserDefinedSinkServicer):
         ]
 
     def SinkFn(
-        self, request_iterator: Iterator[Datum], context: NumaflowServicerContext
+        self, request_iterator: Iterator[udsink_pb2.DatumRequest], context: NumaflowServicerContext
     ) -> udsink_pb2.ResponseList:
         """
         Applies a sink function to a list of datum elements.
         The pascal case function name comes from the proto udsink_pb2_grpc.py file.
         """
         # if there is an exception, we will mark all the responses as a failure
+        datum_iterator = datum_generator(request_iterator)
         try:
-            rspns = self.__sink_handler(request_iterator)
+            rspns = self.__sink_handler(datum_iterator)
         except Exception as err:
             err_msg = "UDSinkError: %r" % err
             _LOGGER.critical(err_msg, exc_info=True)
             rspns = Responses()
-            for _datum in request_iterator:
+            for _datum in datum_iterator:
                 rspns.append(Response.as_failure(_datum.id, err_msg))
 
         responses = []
@@ -101,31 +116,6 @@ class UserDefinedSinkServicer(udsink_pb2_grpc.UserDefinedSinkServicer):
         """
         return udsink_pb2.ReadyResponse(ready=True)
 
-    async def __serve_async(self, server) -> None:
-        udsink_pb2_grpc.add_UserDefinedSinkServicer_to_server(
-            UserDefinedSinkServicer(self.__sink_handler), server
-        )
-        server.add_insecure_port(self.sock_path)
-        _LOGGER.info("GRPC Async Server listening on: %s", self.sock_path)
-        await server.start()
-
-        async def server_graceful_shutdown():
-            _LOGGER.info("Starting graceful shutdown...")
-            """
-            Shuts down the server with 5 seconds of grace period. During the
-            grace period, the server won't accept new connections and allow
-            existing RPCs to continue within the grace period.
-            await server.stop(5)
-            """
-
-        self.cleanup_coroutines.append(server_graceful_shutdown())
-        await server.wait_for_termination()
-
-    async def start_async(self) -> None:
-        """Starts the Async gRPC server on the given UNIX socket."""
-        server = grpc.aio.server(options=self._server_options)
-        await self.__serve_async(server)
-
     def start(self) -> None:
         """
         Starts the gRPC server on the given UNIX socket with given max threads.
@@ -133,11 +123,16 @@ class UserDefinedSinkServicer(udsink_pb2_grpc.UserDefinedSinkServicer):
         server = grpc.server(
             ThreadPoolExecutor(max_workers=self._max_threads), options=self._server_options
         )
-        udsink_pb2_grpc.add_UserDefinedSinkServicer_to_server(
-            UserDefinedSinkServicer(self.__sink_handler), server
-        )
+        udsink_pb2_grpc.add_UserDefinedSinkServicer_to_server(Sink(self.__sink_handler), server)
         server.add_insecure_port(self.sock_path)
         server.start()
+        serv_info = ServerInfo(
+            protocol=Protocol.UDS,
+            language=Language.PYTHON,
+            version=get_sdk_version(),
+        )
+        info_server_write(server_info=serv_info, info_file=SERVER_INFO_FILE_PATH)
+
         _LOGGER.info(
             "GRPC Server listening on: %s with max threads: %s", self.sock_path, self._max_threads
         )

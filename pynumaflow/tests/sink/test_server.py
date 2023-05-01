@@ -7,7 +7,7 @@ from google.protobuf import timestamp_pb2 as _timestamp_pb2
 from grpc import StatusCode
 from grpc_testing import server_from_dictionary, strict_real_time
 
-from pynumaflow.sink import Responses, Datum, Response, UserDefinedSinkServicer
+from pynumaflow.sink import Responses, Datum, Response, Sink
 from pynumaflow.sink.proto import udsink_pb2
 
 
@@ -47,7 +47,7 @@ def mock_watermark():
 
 class TestServer(unittest.TestCase):
     def setUp(self) -> None:
-        my_servicer = UserDefinedSinkServicer(udsink_handler)
+        my_servicer = Sink(udsink_handler)
         services = {udsink_pb2.DESCRIPTOR.services_by_name["UserDefinedSink"]: my_servicer}
         self.test_server = server_from_dictionary(services, strict_real_time())
 
@@ -67,7 +67,7 @@ class TestServer(unittest.TestCase):
         self.assertEqual(code, StatusCode.OK)
 
     def test_udsink_err(self):
-        my_servicer = UserDefinedSinkServicer(err_udsink_handler)
+        my_servicer = Sink(err_udsink_handler)
         services = {udsink_pb2.DESCRIPTOR.services_by_name["UserDefinedSink"]: my_servicer}
         self.test_server = server_from_dictionary(services, strict_real_time())
 
@@ -77,13 +77,13 @@ class TestServer(unittest.TestCase):
         watermark_timestamp.FromDatetime(dt=mock_watermark())
 
         test_datums = [
-            udsink_pb2.Datum(
+            udsink_pb2.DatumRequest(
                 id="test_id_0",
                 value=mock_message(),
                 event_time=udsink_pb2.EventTime(event_time=event_time_timestamp),
                 watermark=udsink_pb2.Watermark(watermark=watermark_timestamp),
             ),
-            udsink_pb2.Datum(
+            udsink_pb2.DatumRequest(
                 id="test_id_1",
                 value=mock_err_message(),
                 event_time=udsink_pb2.EventTime(event_time=event_time_timestamp),
@@ -120,13 +120,13 @@ class TestServer(unittest.TestCase):
         watermark_timestamp.FromDatetime(dt=mock_watermark())
 
         test_datums = [
-            udsink_pb2.Datum(
+            udsink_pb2.DatumRequest(
                 id="test_id_0",
                 value=mock_message(),
                 event_time=udsink_pb2.EventTime(event_time=event_time_timestamp),
                 watermark=udsink_pb2.Watermark(watermark=watermark_timestamp),
             ),
-            udsink_pb2.Datum(
+            udsink_pb2.DatumRequest(
                 id="test_id_1",
                 value=mock_err_message(),
                 event_time=udsink_pb2.EventTime(event_time=event_time_timestamp),
