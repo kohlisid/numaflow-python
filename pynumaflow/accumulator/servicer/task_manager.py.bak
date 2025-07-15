@@ -64,12 +64,6 @@ class TaskManager:
         # This queue is also used to send the error/exceptions to the client
         # if the reduce operation fails.
         self.global_result_queue = NonBlockingIterator()
-        
-        # EOF message confirmation mechanism
-        # Track how many EOF messages have been sent and confirmed
-        self.eof_messages_sent = 0
-        self.eof_messages_confirmed = 0
-        self.eof_confirmation_event = asyncio.Event()
 
     def get_unique_windows(self):
         """
@@ -235,8 +229,6 @@ class TaskManager:
         # then send the error to the result queue
         except BaseException as err:
             _LOGGER.critical("panic inside accumulator handle", exc_info=True)
-            # Set EOF confirmation event in case of error to prevent hanging
-            self.eof_confirmation_event.set()
             # Put the exception in the result queue
             await self.global_result_queue.put(err)
 
@@ -295,51 +287,22 @@ class TaskManager:
                 con_future = task.consumer_future
                 await con_future
 
-            # Send a single EOF message for the entire session
-            start_dt_eof_pb = timestamp_pb2.Timestamp()
-            start_dt_eof_pb.FromDatetime(datetime.fromtimestamp(0))
-            
-            end_dt_eof_pb = timestamp_pb2.Timestamp()
-            end_dt_eof_pb.FromDatetime(datetime.now())
-            
-            eof_response = accumulator_pb2.AccumulatorResponse(
-                payload=accumulator_pb2.Payload(
-                    keys=[],  # Empty keys for session EOF
-                    value=b'',  # Empty value for EOF message
-                    event_time=start_dt_eof_pb,
-                    watermark=end_dt_eof_pb,
-                    headers={},
-                    id="",
-                ),
-                window=accumulator_pb2.KeyedWindow(
-                    start=start_dt_eof_pb, end=end_dt_eof_pb, slot="slot-0", keys=[]
-                ),
-                EOF=True,
-            )
-            await self.global_result_queue.put(eof_response)
-            
-            # Increment the number of EOF messages sent
-            self.eof_messages_sent += 1
-            
-            # Wait for all EOF messages to be confirmed before sending final STREAM_EOF
-            await self.eof_confirmation_event.wait()
-            
-            # Once all tasks are completed, send EOF to the global result queue
+            # # Once all tasks are completed, send EOF to all windows that
+            # # were processed in the Task Manager. We send a single
+            # # EOF message per window.
+            # current_windows = self.get_unique_windows()
+            # for window in current_windows.values():
+            #     # Send an EOF message to the global result queue
+            #     # This will signal that window has been processed
+            #     eof_window_msg = create_window_eof_response(window=window)
+            #     await self.global_result_queue.put(eof_window_msg)
+
+            # Once all tasks are completed, senf EOF the global result queue
             await self.global_result_queue.put(STREAM_EOF)
         except BaseException as e:
             err_msg = f"Reduce Streaming Error: {repr(e)}"
             _LOGGER.critical(err_msg, exc_info=True)
-            # Set EOF confirmation event in case of error to prevent hanging
-            self.eof_confirmation_event.set()
             await self.global_result_queue.put(e)
-
-    async def confirm_eof(self):
-        # Called by consumer once EOF is processed
-        self.eof_messages_confirmed += 1
-        
-        # Check if all EOF messages have been confirmed (expecting 1 EOF per session)
-        if self.eof_messages_sent == self.eof_messages_confirmed:
-            self.eof_confirmation_event.set()
 
     async def write_to_global_queue(
         self, input_queue: NonBlockingIterator, output_queue: NonBlockingIterator, unified_key: str
@@ -396,9 +359,30 @@ class TaskManager:
                 tags=msg.tags,
             )
             await output_queue.put(res)
-        # Don't send EOF message here - it will be sent once per session
-        # Mark that this task has completed
-        pass
+        # send EOF
+        start_dt_eof_pb = timestamp_pb2.Timestamp()
+        start_dt_eof_pb.FromDatetime(datetime.fromtimestamp(0))
+        
+        end_dt_eof_pb = timestamp_pb2.Timestamp()
+        end_dt_eof_pb.FromDatetime(wm)
+        
+        res = accumulator_pb2.AccumulatorResponse(
+            payload=accumulator_pb2.Payload(
+                keys=task.keys,
+                value=b'',  # Empty value for EOF message
+                event_time=start_dt_eof_pb,
+                watermark=end_dt_eof_pb,
+                headers={},
+                id="",
+            ),
+            window=accumulator_pb2.KeyedWindow(
+                start=start_dt_eof_pb, end=end_dt_eof_pb, slot="slot-0", keys=task.keys
+            ),
+            EOF=True,
+        )
+        await output_queue.put(res)
+        # Add a small delay to ensure EOF message is processed before final STREAM_EOF
+        await asyncio.sleep(0.05)
 
     def clean_background(self, task):
         """

@@ -103,6 +103,10 @@ class AsyncAccumulatorServicer(accumulator_pb2_grpc.AccumulatorServicer):
                 # back to the client
                 else:
                     yield msg
+
+                    if msg.EOF:
+                        # Confirm EOF was received if appropriate
+                        await task_manager.confirm_eof()
         except BaseException as e:
             await handle_async_error(context, e, ERR_UDF_EXCEPTION_STRING)
             return

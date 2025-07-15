@@ -19,7 +19,7 @@ class WindowOperation(IntEnum):
 
     OPEN = (0,)
     CLOSE = (1,)
-    APPEND = (4,)
+    APPEND = (2,)
 
 
 @dataclass(init=False)
