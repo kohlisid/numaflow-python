@@ -3,6 +3,7 @@ from collections.abc import AsyncIterable
 from datetime import datetime
 from typing import Union
 
+from google.protobuf import timestamp_pb2
 from pynumaflow._constants import (
     STREAM_EOF,
     DELIMITER,
@@ -17,13 +18,12 @@ from pynumaflow.accumulator._dtypes import (
 )
 from pynumaflow.proto.accumulator import accumulator_pb2
 from pynumaflow.shared.asynciter import NonBlockingIterator
-from google.protobuf import timestamp_pb2 as _timestamp_pb2
 
 
 def build_unique_key_name(keys):
     """
     Builds a unique key name for the given keys and window.
-    The key name is used to identify the Reduce task.
+    The key name is used to identify the Accumulator task.
     The format is: start_time:end_time:key1:key2:...
     """
     return f"{DELIMITER.join(keys)}"
@@ -32,21 +32,16 @@ def build_unique_key_name(keys):
 def build_window_hash(window):
     """
     Builds a hash for the given window.
-    The hash is used to identify the Reduce Window
+    The hash is used to identify the Accumulator Window
     The format is: start_time:end_time
     """
     return f"{window.start.ToMilliseconds()}:{window.end.ToMilliseconds()}"
 
 
-def create_window_eof_response(window):
-    """Create a Reduce response with EOF=True for a given window"""
-    return accumulator_pb2.ReduceResponse(window=window, EOF=True)
-
-
 class TaskManager:
     """
-    TaskManager is responsible for managing the Reduce tasks.
-    It is created whenever a new reduce operation is requested.
+    TaskManager is responsible for managing the Accumulator tasks.
+    It is created whenever a new accumulator operation is requested.
     """
 
     def __init__(self, handler: Union[AccumulatorAsyncCallable, _AccumulatorBuilderClass]):
@@ -56,13 +51,13 @@ class TaskManager:
         # Event loop only keeps a weak reference, which can cause it to
         # get lost during execution.
         self.background_tasks = set()
-        # Handler for the reduce operation
+        # Handler for the accumulator operation
         self.__accumulator_handler = handler
-        # Queue to store the results of the reduce operation
+        # Queue to store the results of the accumulator operation
         # This queue is used to send the results to the client
-        # once the reduce operation is completed.
+        # once the accumulator operation is completed.
         # This queue is also used to send the error/exceptions to the client
-        # if the reduce operation fails.
+        # if the accumulator operation fails.
         self.global_result_queue = NonBlockingIterator()
 
     def get_unique_windows(self):
@@ -82,29 +77,43 @@ class TaskManager:
 
     def get_tasks(self):
         """
-        Returns the list of reduce tasks that are
+        Returns the list of accumulator tasks that are
         currently being processed
         """
         return list(self.tasks.values())
 
     async def stream_send_eof(self):
         """
-        Sends EOF to input streams of all the Reduce
-        tasks that are currently being processed.
+        Function used to indicate to all processing tasks that no
+        more requests are expected by sending EOF message to
+        local input streams of individual tasks.
         This is called when the input grpc stream is closed.
         """
-        for unified_key in self.tasks:
+        # Create a copy of the keys to avoid dictionary size change during iteration
+        task_keys = list(self.tasks.keys())
+        for unified_key in task_keys:
             await self.tasks[unified_key].iterator.put(STREAM_EOF)
-        self.tasks.clear()
 
     async def close_task(self, req):
+        """
+        Closes a running accumulator task for a given key.
+        Based on the request we compute the unique key, and then
+        signal the corresponding task for it to closure.
+        The steps involve
+        1. Send a signal to the local request queue of the task to stop reading
+        2. Wait for the user function to complete
+        3. Wait for all the results from the task to be written to the global result  queue
+        4. Remove the task from the tracker
+        """
         d = req.payload
-        keys = d.keys
+        keys = d.keys()
         unified_key = build_unique_key_name(keys)
         curr_task = self.tasks.get(unified_key, None)
 
         if curr_task:
             await self.tasks[unified_key].iterator.put(STREAM_EOF)
+            await curr_task.future
+            await curr_task.consumer_future
             self.tasks.pop(unified_key)
         else:
             _LOGGER.critical("accumulator task not found", exc_info=True)
@@ -119,7 +128,7 @@ class TaskManager:
         it creates a new task or appends the request to the existing task.
         """
         d = req.payload
-        keys = d.keys
+        keys = d.keys()
         unified_key = build_unique_key_name(keys)
         curr_task = self.tasks.get(unified_key, None)
 
@@ -129,7 +138,7 @@ class TaskManager:
             riter = niter.read_iterator()
             # Create a new result queue for the current task
             # We create a new result queue for each task, so that
-            # the results of the reduce operation can be sent to the
+            # the results of the accumulator operation can be sent to the
             # the global result queue, which in turn sends the results
             # to the client.
             res_queue = NonBlockingIterator()
@@ -146,7 +155,7 @@ class TaskManager:
             consumer.add_done_callback(self.clean_background)
 
             # Create a new task for the accumulator operation, this will invoke the
-            # Reduce handler with the given keys, request iterator, and window.
+            # Accumulator handler with the given keys, request iterator, and window.
             task = asyncio.create_task(self.__invoke_accumulator(riter, res_queue))
             # Save a reference to the result of this function, to avoid a
             # task disappearing mid-execution.
@@ -158,7 +167,7 @@ class TaskManager:
                 task, niter, keys, res_queue, consumer, datetime.fromtimestamp(-1)
             )
 
-            # Save the result of the reduce operation to the task list
+            # Save the result of the accumulator operation to the task list
             self.tasks[unified_key] = curr_task
 
         # Put the request in the iterator
@@ -179,20 +188,20 @@ class TaskManager:
             await result.iterator.put(d)
 
     async def __invoke_accumulator(
-            self,
-            request_iterator: AsyncIterable[Datum],
-            output: NonBlockingIterator,
+        self,
+        request_iterator: AsyncIterable[Datum],
+        output: NonBlockingIterator,
     ):
         """
-        Invokes the UDF reduce handler with the given keys,
+        Invokes the UDF accumulator handler with the given keys,
         request iterator, and window. Returns the result of the
-        reduce operation.
+        accumulator operation.
         """
         new_instance = self.__accumulator_handler
 
         # If the accumulator handler is a class instance, create a new instance of it.
         # It is required for a new key to be processed by a
-        # new instance of the reducer for a given window
+        # new instance of the accumulator for a given window
         # Otherwise the function handler can be called directly
         if isinstance(self.__accumulator_handler, _AccumulatorBuilderClass):
             new_instance = self.__accumulator_handler.create()
@@ -200,7 +209,7 @@ class TaskManager:
             _ = await new_instance(request_iterator, output)
             # send EOF to the output stream
             await output.put(STREAM_EOF)
-        # If there is an error in the reduce operation, log and
+        # If there is an error in the accumulator operation, log and
         # then send the error to the result queue
         except BaseException as err:
             _LOGGER.critical("panic inside accumulator handle", exc_info=True)
@@ -208,27 +217,30 @@ class TaskManager:
             await self.global_result_queue.put(err)
 
     async def process_input_stream(
-            self, request_iterator: AsyncIterable[accumulator_pb2.AccumulatorRequest]
+        self, request_iterator: AsyncIterable[accumulator_pb2.AccumulatorRequest]
     ):
         # Start iterating through the request iterator and create tasks
         # based on the operation type received.
         try:
+            request_count = 0
             async for request in request_iterator:
-                # print("IM HERE", request.payload.keys)
+                request_count += 1
                 # check whether the request is an open or append operation
-                if request.operation.event is int(WindowOperation.OPEN):
-
+                if request.operation is int(WindowOperation.OPEN):
                     # create a new task for the open operation and
                     # put the request in the task iterator
                     await self.create_task(request)
-                elif request.operation.event is int(WindowOperation.APPEND):
+                elif request.operation is int(WindowOperation.APPEND):
                     # append the task data to the existing task
                     # if the task does not exist, create a new task
                     await self.send_datum_to_task(request)
-                elif request.operation.event is int(WindowOperation.CLOSE):
+                elif request.operation is int(WindowOperation.CLOSE):
                     # close the current task for req
                     await self.close_task(request)
-        # If there is an error in the reduce operation, log and
+                else:
+                    _LOGGER.debug(f"No operation matched for request: {request}", exc_info=True)
+
+        # If there is an error in the accumulator operation, log and
         # then send the error to the result queue
         except BaseException as e:
             err_msg = f"Accumulator Error: {repr(e)}"
@@ -243,7 +255,7 @@ class TaskManager:
             # respective iterators.
             await self.stream_send_eof()
 
-            # get the list of reduce tasks that are currently being processed
+            # get the list of accumulator tasks that are currently being processed
             # iterate through the tasks and wait for them to complete
             for task in self.get_tasks():
                 # Once this is done, we know that the task has written all the results
@@ -251,87 +263,81 @@ class TaskManager:
                 fut = task.future
                 await fut
 
-                # # Send an EOF message to the local result queue
-                # # This will signal that the task has completed processing
-                # await task.result_queue.put(STREAM_EOF)
-
                 # Wait for the local queue to write
                 # all the results of this task to the global result queue
                 con_future = task.consumer_future
                 await con_future
+            self.tasks.clear()
 
-            # # Once all tasks are completed, send EOF to all windows that
-            # # were processed in the Task Manager. We send a single
-            # # EOF message per window.
-            # current_windows = self.get_unique_windows()
-            # for window in current_windows.values():
-            #     # Send an EOF message to the global result queue
-            #     # This will signal that window has been processed
-            #     eof_window_msg = create_window_eof_response(window=window)
-            #     await self.global_result_queue.put(eof_window_msg)
-
-            # Once all tasks are completed, senf EOF the global result queue
+            # Now send STREAM_EOF to terminate the global result queue iterator
             await self.global_result_queue.put(STREAM_EOF)
         except BaseException as e:
-            err_msg = f"Reduce Streaming Error: {repr(e)}"
+            err_msg = f"Accumulator Streaming Error: {repr(e)}"
             _LOGGER.critical(err_msg, exc_info=True)
             await self.global_result_queue.put(e)
 
     async def write_to_global_queue(
-            self, input_queue: NonBlockingIterator, output_queue: NonBlockingIterator, unified_key: str
+        self, input_queue: NonBlockingIterator, output_queue: NonBlockingIterator, unified_key: str
     ):
         """
-        This task is for given Reduce task.
-        This would from the local result queue for the task and then write
-        to the global result queue
+        This function is used to route the messages from the
+        local result queue for a given task to the global result queue.
+        Once all messages are routed, it sends the window EOF messages for the same.
         """
         reader = input_queue.read_iterator()
         task = self.tasks[unified_key]
 
-        wm = task.latest_watermark
+        wm: datetime = task.latest_watermark
         async for msg in reader:
             # Convert the window to a datetime object
-            if wm < msg.watermark:
+            # Only update watermark if msg.watermark is not None
+            if msg.watermark is not None and wm < msg.watermark:
                 task.update_watermark(msg.watermark)
                 self.tasks[unified_key] = task
                 wm = msg.watermark
 
-            event_time_timestamp = _timestamp_pb2.Timestamp()
-            t = datetime.fromtimestamp(0)
-            event_time_timestamp.FromDatetime(dt=t)
+            # Convert datetime to protobuf timestamp
+            event_time_pb = timestamp_pb2.Timestamp()
+            if msg.event_time is not None:
+                event_time_pb.FromDatetime(msg.event_time)
 
-            event_time_timestamp_end = _timestamp_pb2.Timestamp()
-            event_time_timestamp_end.FromDatetime(dt=wm)
+            watermark_pb = timestamp_pb2.Timestamp()
+            if msg.watermark is not None:
+                watermark_pb.FromDatetime(msg.watermark)
+
+            start_dt_pb = timestamp_pb2.Timestamp()
+            start_dt_pb.FromDatetime(datetime.fromtimestamp(0))
+
+            end_dt_pb = timestamp_pb2.Timestamp()
+            end_dt_pb.FromDatetime(wm)
 
             res = accumulator_pb2.AccumulatorResponse(
                 payload=accumulator_pb2.Payload(
                     keys=msg.keys,
                     value=msg.value,
-                    event_time=msg.event_time,
-                    watermark=msg.watermark,
+                    event_time=event_time_pb,
+                    watermark=watermark_pb,
                     headers=msg.headers,
                     id=msg.id,
                 ),
                 window=accumulator_pb2.KeyedWindow(
-                    start=event_time_timestamp, end=event_time_timestamp_end, slot="slot-0", keys=task.keys
+                    start=start_dt_pb, end=end_dt_pb, slot="slot-0", keys=task.keys
                 ),
                 EOF=False,
                 tags=msg.tags,
             )
             await output_queue.put(res)
         # send EOF
-        event_time_timestamp = _timestamp_pb2.Timestamp()
-        t = datetime.fromtimestamp(0)
-        event_time_timestamp.FromDatetime(dt=t)
+        start_eof_pb = timestamp_pb2.Timestamp()
+        start_eof_pb.FromDatetime(datetime.fromtimestamp(0))
 
-        event_time_timestamp_end = _timestamp_pb2.Timestamp()
-        event_time_timestamp_end.FromDatetime(dt=wm)
+        end_eof_pb = timestamp_pb2.Timestamp()
+        end_eof_pb.FromDatetime(wm)
 
-        window = accumulator_pb2.KeyedWindow(
-            start=event_time_timestamp, end=event_time_timestamp_end, slot="slot-0", keys=task.keys
-        )
         res = accumulator_pb2.AccumulatorResponse(
-            window=window,
+            window=accumulator_pb2.KeyedWindow(
+                start=start_eof_pb, end=end_eof_pb, slot="slot-0", keys=task.keys
+            ),
             EOF=True,
         )
         await output_queue.put(res)

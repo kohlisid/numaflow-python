@@ -11,6 +11,7 @@ from pynumaflow.accumulator._dtypes import (
     AccumulatorAsyncCallable,
     _AccumulatorBuilderClass,
     AccumulatorRequest,
+    KeyedWindow,
 )
 from pynumaflow.accumulator.servicer.task_manager import TaskManager
 from pynumaflow.shared.server import handle_async_error
@@ -22,23 +23,32 @@ async def datum_generator(
 ) -> AsyncIterable[AccumulatorRequest]:
     """Generate a AccumulatorRequest from a AccumulatorRequest proto message."""
     async for d in request_iterator:
-        reduce_request = AccumulatorRequest(
+        # Convert protobuf KeyedWindow to our KeyedWindow dataclass
+        keyed_window = KeyedWindow(
+            start=d.operation.keyedWindow.start.ToDatetime(),
+            end=d.operation.keyedWindow.end.ToDatetime(),
+            slot=d.operation.keyedWindow.slot,
+            keys=list(d.operation.keyedWindow.keys),
+        )
+
+        accumulator_request = AccumulatorRequest(
             operation=d.operation.event,
-            windows=d.operation.windows,
+            keyed_window=keyed_window,  # Use the new parameter name
             payload=Datum(
                 keys=list(d.payload.keys),
                 value=d.payload.value,
                 event_time=d.payload.event_time.ToDatetime(),
                 watermark=d.payload.watermark.ToDatetime(),
+                id_=d.payload.id,
                 headers=dict(d.payload.headers),
             ),
         )
-        yield reduce_request
+        yield accumulator_request
 
 
 class AsyncAccumulatorServicer(accumulator_pb2_grpc.AccumulatorServicer):
     """
-    This class is used to create a new grpc Reduce servicer instance.
+    This class is used to create a new grpc Accumulator servicer instance.
     Provides the functionality for the required rpc methods.
     """
 
@@ -69,28 +79,28 @@ class AsyncAccumulatorServicer(accumulator_pb2_grpc.AccumulatorServicer):
         consumer = task_manager.global_result_queue.read_iterator()
 
         # Create an async iterator from the request iterator
-        # datum_iterator = datum_generator(request_iterator=request_iterator)
+        datum_iterator = datum_generator(request_iterator=request_iterator)
 
         # Create a process_input_stream task in the task manager,
         # this would read from the datum iterator
         # and then create the required tasks to process the data requests
         # The results from these tasks are then sent to the result queue
-        producer = asyncio.create_task(task_manager.process_input_stream(request_iterator))
+        producer = asyncio.create_task(task_manager.process_input_stream(datum_iterator))
 
         # Start the consumer task where we read from the result queue
         # and send the results to the client
         # The task manager can write the following to the result queue:
-        # 1. A accumulator_pb2.ReduceResponse message
-        # This is the result of the reduce function, it contains the window and the
-        # result of the reduce function
-        # The result of the reduce function is a accumulator_pb2.ReduceResponse message and can be
-        # directly sent to the client
+        # 1. A accumulator_pb2.AccumulatorResponse message
+        # This is the result of the accumulator function, it contains the window and the
+        # result of the accumulator function
+        # The result of the accumulator function is a accumulator_pb2.AccumulatorResponse message
+        #  and can be directly sent to the client
         #
         # 2. An Exception
-        # Any exceptions that occur during the processing reduce function tasks are
+        # Any exceptions that occur during the processing accumulator function tasks are
         # sent to the result queue. We then forward these exception to the client
         #
-        # 3. A accumulator_pb2.ReduceResponse message with EOF=True
+        # 3. A accumulator_pb2.AccumulatorResponse message with EOF=True
         # This is a special message that indicates the end of the processing for a window
         # When we get this message, we send an EOF message to the client
         try:

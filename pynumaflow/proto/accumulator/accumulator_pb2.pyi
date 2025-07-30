@@ -47,7 +47,7 @@ class Payload(_message.Message):
     ) -> None: ...
 
 class AccumulatorRequest(_message.Message):
-    __slots__ = ("payload", "operation", "handshake")
+    __slots__ = ("payload", "operation")
 
     class WindowOperation(_message.Message):
         __slots__ = ("event", "keyedWindow")
@@ -71,15 +71,12 @@ class AccumulatorRequest(_message.Message):
         ) -> None: ...
     PAYLOAD_FIELD_NUMBER: _ClassVar[int]
     OPERATION_FIELD_NUMBER: _ClassVar[int]
-    HANDSHAKE_FIELD_NUMBER: _ClassVar[int]
     payload: Payload
     operation: AccumulatorRequest.WindowOperation
-    handshake: Handshake
     def __init__(
         self,
         payload: _Optional[_Union[Payload, _Mapping]] = ...,
         operation: _Optional[_Union[AccumulatorRequest.WindowOperation, _Mapping]] = ...,
-        handshake: _Optional[_Union[Handshake, _Mapping]] = ...,
     ) -> None: ...
 
 class KeyedWindow(_message.Message):
@@ -101,23 +98,20 @@ class KeyedWindow(_message.Message):
     ) -> None: ...
 
 class AccumulatorResponse(_message.Message):
-    __slots__ = ("payload", "window", "tags", "handshake", "EOF")
+    __slots__ = ("payload", "window", "tags", "EOF")
     PAYLOAD_FIELD_NUMBER: _ClassVar[int]
     WINDOW_FIELD_NUMBER: _ClassVar[int]
     TAGS_FIELD_NUMBER: _ClassVar[int]
-    HANDSHAKE_FIELD_NUMBER: _ClassVar[int]
     EOF_FIELD_NUMBER: _ClassVar[int]
     payload: Payload
     window: KeyedWindow
     tags: _containers.RepeatedScalarFieldContainer[str]
-    handshake: Handshake
     EOF: bool
     def __init__(
         self,
         payload: _Optional[_Union[Payload, _Mapping]] = ...,
         window: _Optional[_Union[KeyedWindow, _Mapping]] = ...,
         tags: _Optional[_Iterable[str]] = ...,
-        handshake: _Optional[_Union[Handshake, _Mapping]] = ...,
         EOF: bool = ...,
     ) -> None: ...
 
@@ -126,9 +120,3 @@ class ReadyResponse(_message.Message):
     READY_FIELD_NUMBER: _ClassVar[int]
     ready: bool
     def __init__(self, ready: bool = ...) -> None: ...
-
-class Handshake(_message.Message):
-    __slots__ = ("sot",)
-    SOT_FIELD_NUMBER: _ClassVar[int]
-    sot: bool
-    def __init__(self, sot: bool = ...) -> None: ...
